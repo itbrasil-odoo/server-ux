@@ -20,45 +20,37 @@ class IrModel(models.Model):
     # But since we use this to patch the original_method
     # I added back again.
     @staticmethod
-    def _patch_method(model_obj, name, method):
-        """Monkey-patch a method for all instances of this model. This replaces
-        the method called ``name`` by ``method`` in the given class.
-        The original method is then accessible via ``method.origin``, and it
-        can be restored with :meth:`~._revert_method`.
+    def _is_quick_create_wrapper(method):
+        return getattr(method, "_avoid_quick_create", False)
 
-        Example::
+    @classmethod
+    def _patch_method(cls_, model_obj, name, method):
+        """Replace the method called ``name`` by ``method`` in the class of
+        ``model_obj``; the replaced method stays available as ``method.origin``.
 
-            def do_write(self, values):
-                # do stuff, and call the original method
-                return do_write.origin(self, values)
-
-            # patch method write of model
-            model._patch_method('write', do_write)
-
-            # this will call do_write
-            records = model.search([...])
-            records.write(...)
-
-            # restore the original method
-            model._revert_method('write')
+        Idempotent: a class already patched by this module is left alone, so
+        repeated calls (write, create, _register_hook after a registry setup)
+        never stack wrappers that a single revert could not remove.
         """
         cls = type(model_obj)
+        if cls_._is_quick_create_wrapper(getattr(cls, name)):
+            return
         origin = getattr(cls, name)
         method.origin = origin
+        method._avoid_quick_create = True
         # Copy api attributes from origin so the ORM treats the wrapper correctly
         for attr in ("_api_model", "_api_private", "_readonly"):
             if hasattr(origin, attr) and not hasattr(method, attr):
                 setattr(method, attr, getattr(origin, attr))
         setattr(cls, name, method)
 
-    @staticmethod
-    def _revert_method(model_obj, name):
-        """Revert the original method called ``name`` in the given class.
-        See :meth:`~._patch_method`.
-        """
+    @classmethod
+    def _revert_method(cls_, model_obj, name):
+        """Restore the method called ``name`` patched by :meth:`_patch_method`,
+        however many times it was patched."""
         cls = type(model_obj)
-        method = getattr(cls, name)
-        setattr(cls, name, method.origin)
+        while cls_._is_quick_create_wrapper(getattr(cls, name)):
+            setattr(cls, name, getattr(cls, name).origin)
 
     def _patch_quick_create(self):
         def _wrap_name_create():
@@ -83,10 +75,8 @@ class IrModel(models.Model):
                 # _wrap_name_create().origin = getattr(model_obj, method_name)
                 # setattr(model_obj, method_name, _wrap_name_create())
                 self._patch_method(model_obj, method_name, _wrap_name_create())
-            else:
-                method = getattr(model_obj, method_name, None)
-                if method and hasattr(method, "origin"):
-                    self._revert_method(model_obj, method_name)
+            elif model_obj is not None:
+                self._revert_method(model_obj, method_name)
         return True
 
     def _register_hook(self):
@@ -94,15 +84,27 @@ class IrModel(models.Model):
         models._patch_quick_create()
         return super()._register_hook()
 
+    def _unregister_hook(self):
+        """Remove the patches installed by _register_hook(): the registry setup
+        runs both hooks again on the same classes."""
+        for model_cls in self.env.registry.values():
+            while self._is_quick_create_wrapper(
+                getattr(model_cls, "name_create", None)
+            ):
+                model_cls.name_create = model_cls.name_create.origin
+        return super()._unregister_hook()
+
     @api.model_create_multi
     def create(self, vals_list):
         ir_models = super().create(vals_list)
-        ir_models._patch_quick_create()
+        if any("avoid_quick_create" in vals for vals in vals_list):
+            ir_models._patch_quick_create()
+            self.env.transaction.will_change_registry()
         return ir_models
 
     def write(self, vals):
         res = super().write(vals)
-        self._patch_quick_create()
         if "avoid_quick_create" in vals:
+            self._patch_quick_create()
             self.env.transaction.will_change_registry()
         return res

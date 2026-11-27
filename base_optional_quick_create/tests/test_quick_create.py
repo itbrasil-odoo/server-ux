@@ -61,3 +61,34 @@ class TestQuickCreate(TransactionCase):
         )
         test_id = self.env["x_.test.model.quick"].name_create("TEST Model")
         self.assertEqual(bool(test_id), True)
+
+    def test_repeated_writes_do_not_stack_the_patch(self):
+        self.partner_model.avoid_quick_create = True
+        self.partner_model.avoid_quick_create = True
+        self.partner_model.write({"name": self.partner_model.name})
+        self.env["ir.model"]._register_hook()
+        with self.assertRaises(UserError):
+            self.env["res.partner"].name_create("TEST partner")
+        self.partner_model.avoid_quick_create = False
+        self.assertTrue(self.env["res.partner"].name_create("TEST partner"))
+
+    def test_unregister_hook_removes_the_patch(self):
+        self.partner_model.avoid_quick_create = True
+        self.env["ir.model"]._unregister_hook()
+        self.assertTrue(self.env["res.partner"].name_create("TEST partner"))
+        self.env["ir.model"]._register_hook()
+        with self.assertRaises(UserError):
+            self.env["res.partner"].name_create("TEST partner")
+
+    def test_new_model_flag_can_be_unset(self):
+        ir_model = self.env["ir.model"].create(
+            {
+                "name": "Test Model",
+                "model": "x_.test.model.unset",
+                "avoid_quick_create": True,
+            }
+        )
+        with self.assertRaises(UserError):
+            self.env["x_.test.model.unset"].name_create("TEST Model")
+        ir_model.avoid_quick_create = False
+        self.assertTrue(self.env["x_.test.model.unset"].name_create("TEST Model"))
